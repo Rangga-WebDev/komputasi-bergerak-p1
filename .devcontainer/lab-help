@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# lab-help — student CLI to raise hand from inside a Codespace.
+#
+# Usage:
+#   lab-help "stuck di null pointer line 42"
+#   lab-help -u high "code segfault terus"
+#
+# Required env (auto-set by Codespace):
+#   GITHUB_TOKEN        Codespace-issued GitHub token for the student.
+#   GITHUB_REPOSITORY   "owner/repo" of the running Codespace.
+#
+# Optional env (set in Codespace secrets or .env):
+#   LAB_DASHBOARD_URL   e.g. https://lab.kampus.ac.id (defaults to LAB_DASHBOARD_URL)
+
+set -euo pipefail
+
+URGENCY="normal"
+while getopts ":u:h" opt; do
+  case "$opt" in
+    u) URGENCY="$OPTARG" ;;
+    h)
+      sed -n '2,12p' "$0"
+      exit 0
+      ;;
+    \?) echo "unknown option -$OPTARG" >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+MESSAGE="${*:-}"
+if [[ -z "$MESSAGE" ]]; then
+  echo "Usage: lab-help [-u low|normal|high] \"pesan kamu\"" >&2
+  exit 1
+fi
+
+: "${GITHUB_TOKEN:?GITHUB_TOKEN tidak terdeteksi (jalankan dari dalam Codespace)}"
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY tidak terdeteksi (jalankan dari dalam Codespace)}"
+
+DASHBOARD_URL="${LAB_DASHBOARD_URL:-${NEXT_PUBLIC_DASHBOARD_URL:-}}"
+if [[ -z "$DASHBOARD_URL" ]]; then
+  echo "❌ LAB_DASHBOARD_URL belum diset. Tambahkan ke Codespace secrets / .env." >&2
+  exit 1
+fi
+
+PAYLOAD=$(cat <<JSON
+{"message": $(printf '%s' "$MESSAGE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+ "repo": "$GITHUB_REPOSITORY",
+ "urgency": "$URGENCY",
+ "source": "cli"}
+JSON
+)
+
+HTTP=$(curl -sS -o /tmp/lab-help.out -w "%{http_code}" \
+  -X POST "$DASHBOARD_URL/api/help/raise" \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD")
+
+if [[ "$HTTP" != "200" ]]; then
+  echo "❌ Gagal angkat tangan (HTTP $HTTP):" >&2
+  cat /tmp/lab-help.out >&2
+  exit 1
+fi
+
+echo "🙋 Tangan terangkat. Tunggu dosen merespons."
+echo "   urgency: $URGENCY"
+echo "   pesan  : $MESSAGE"

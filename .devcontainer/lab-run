@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# lab-run — jalankan perintah apa saja, output ditee ke /tmp/lab-terminal.log
+# supaya `lab-live` bisa stream ke dashboard instruktur.
+#
+# Usage:
+#   lab-run npm run dev
+#   lab-run python main.py
+#   lab-run -- pytest -q              # gunakan -- untuk hindari interpretasi flag
+#
+# Env:
+#   LAB_TERMINAL_LOG   override path log (default /tmp/lab-terminal.log)
+#   LAB_TERMINAL_MAX   ukuran maks log dalam bytes (default 256000 = 250KB)
+
+set -o pipefail
+
+LOG="${LAB_TERMINAL_LOG:-/tmp/lab-terminal.log}"
+MAX="${LAB_TERMINAL_MAX:-256000}"
+
+# Sentinel utk auto-wrapper /etc/profile.d/lab-auto-wrap.sh — supaya alias
+# (npm, node, python, dst) yang memanggil `lab-run` tidak rekursif saat
+# lab-run sendiri memanggil command aslinya.
+export LAB_RUN_ACTIVE=1
+
+if [ "$#" -eq 0 ]; then
+  echo "Usage: lab-run <command> [args...]" >&2
+  exit 2
+fi
+
+# Drop leading "--" sentinel kalau dipakai.
+if [ "$1" = "--" ]; then shift; fi
+
+# Rotate kalau log udah kegedean.
+if [ -f "$LOG" ]; then
+  SZ=$(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG" 2>/dev/null || echo 0)
+  if [ "$SZ" -gt "$MAX" ]; then
+    : > "$LOG"
+  fi
+fi
+
+# Header tiap run biar mudah diidentifikasi di dashboard.
+{
+  printf '\n\033[2m─── lab-run %s ───\033[0m\n' "$(date +%H:%M:%S)"
+  printf '\033[1m$ %s\033[0m\n' "$*"
+} | tee -a "$LOG"
+
+# Eksekusi: stdout+stderr → tee → log + terminal user.
+# `script -q -c` opsional untuk pertahankan TTY/warna; pakai stdbuf agar
+# output flushing rajin.
+if command -v stdbuf >/dev/null 2>&1; then
+  stdbuf -oL -eL "$@" 2>&1 | tee -a "$LOG"
+else
+  "$@" 2>&1 | tee -a "$LOG"
+fi
+RC=${PIPESTATUS[0]}
+
+printf '\n\033[2m─── exit %d ───\033[0m\n' "$RC" | tee -a "$LOG"
+exit "$RC"

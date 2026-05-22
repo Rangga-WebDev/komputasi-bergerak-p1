@@ -1,0 +1,14 @@
+name: Autograding
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run autograder
+        # TODO: ganti dengan classroom-resources/autograding@v1 atau script tes kamu.
+        run: echo "Autograding (0/10)"

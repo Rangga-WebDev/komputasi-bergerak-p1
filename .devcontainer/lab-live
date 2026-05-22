@@ -1,0 +1,601 @@
+#!/usr/bin/env node
+/**
+ * lab-live.mjs — Real-time file watcher for student Codespaces.
+ *
+ * Watches the working tree and syncs file contents to a Yjs document
+ * via y-websocket so the instructor dashboard can display code changes
+ * in real-time (per-keystroke level when files.autoSave is on).
+ *
+ * Usage:
+ *   node lab-live.mjs                         # auto-detect from env
+ *   node lab-live.mjs --ws wss://lab.example.com:4444
+ *   LAB_YJS_WS_URL=wss://... node lab-live.mjs
+ *
+ * Env vars (set as Codespace org secrets):
+ *   LAB_YJS_WS_URL       WebSocket URL of y-websocket server
+ *   LAB_DASHBOARD_URL    Dashboard base URL (fallback: derives WS URL)
+ *   GITHUB_REPOSITORY    owner/repo (auto-set in Codespaces)
+ */
+
+import { execSync } from "node:child_process";
+import { readFileSync, statSync, watch } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { argv, cwd, env, exit } from "node:process";
+
+// ── Args / env ──────────────────────────────────────────────────────────
+const args = argv.slice(2);
+function flag(name) {
+  const i = args.indexOf(name);
+  if (i === -1) return undefined;
+  return args[i + 1];
+}
+
+const wsUrl =
+  flag("--ws") ||
+  env.LAB_YJS_WS_URL ||
+  (env.LAB_DASHBOARD_URL
+    ? env.LAB_DASHBOARD_URL.replace(/^https?/, "ws").replace(/\/$/, "") + ":4444"
+    : null);
+
+const repoFullName =
+  flag("--repo") ||
+  env.GITHUB_REPOSITORY ||
+  (() => {
+    try {
+      return execSync("git remote get-url origin", { encoding: "utf8" })
+        .trim()
+        .replace(/\.git$/, "")
+        .split("/")
+        .slice(-2)
+        .join("/");
+    } catch {
+      return null;
+    }
+  })();
+
+if (!wsUrl) {
+  console.error(
+    "❌ LAB_YJS_WS_URL atau LAB_DASHBOARD_URL belum diset.\n" +
+      "   Set sebagai Codespace org secret, atau: node lab-live.mjs --ws wss://host:4444"
+  );
+  exit(1);
+}
+if (!repoFullName) {
+  console.error("❌ Tidak bisa mendeteksi nama repo. Set GITHUB_REPOSITORY.");
+  exit(1);
+}
+
+// ── Dynamic imports (ESM) ───────────────────────────────────────────────
+const Y = await import("yjs");
+const { WebsocketProvider } = await import("y-websocket");
+const { WebSocket: WS } = await import("ws");
+
+// ── Constants ───────────────────────────────────────────────────────────
+const ROOM = `live:${repoFullName.replace("/", "__")}`;
+// Cari root: prefer git toplevel, fallback ke env LAB_ROOT, lalu ke cwd.
+let ROOT;
+try {
+  ROOT = execSync("git rev-parse --show-toplevel", {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+} catch {
+  ROOT = env.LAB_ROOT || cwd();
+  console.warn(`⚠️  Bukan git repo. Memantau direktori: ${ROOT}`);
+}
+const MAX_FILE_SIZE = 500_000; // 500KB
+const DEBOUNCE_MS = 300;
+
+const SKIP_DIRS = new Set([
+  "node_modules", ".git", ".next", "dist", "build", "out",
+  "__pycache__", ".venv", "venv", "target", ".lab", ".devcontainer",
+  ".cache", "coverage", ".nyc_output",
+]);
+
+const SKIP_EXT = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
+  ".zip", ".tar", ".gz", ".7z", ".exe", ".bin",
+  ".woff", ".woff2", ".ttf", ".otf",
+  ".mp3", ".mp4", ".mov", ".avi",
+  ".lock", ".sqlite", ".db",
+]);
+
+// ── Yjs setup ───────────────────────────────────────────────────────────
+const doc = new Y.Doc();
+const yFiles = doc.getMap("files");       // path → content string
+const yTree = doc.getArray("tree");       // [{path, type, size}]
+const yMeta = doc.getMap("meta");         // metadata
+
+const provider = new WebsocketProvider(wsUrl, ROOM, doc, {
+  WebSocketPolyfill: WS,
+  connect: true,
+  resyncInterval: 10_000,
+  maxBackoffTime: 5_000,
+});
+
+provider.on("status", ({ status }) => {
+  const icon = status === "connected" ? "🟢" : "🔴";
+  console.log(`${icon} y-websocket: ${status} (room: ${ROOM})`);
+});
+
+provider.on("connection-error", (err) => {
+  console.error("⚠️  Connection error:", err.message || err);
+});
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+function shouldSkip(relPath) {
+  const parts = relPath.split(sep);
+  for (const p of parts) {
+    if (SKIP_DIRS.has(p)) return true;
+  }
+  const ext = relPath.slice(relPath.lastIndexOf(".")).toLowerCase();
+  if (SKIP_EXT.has(ext)) return true;
+  return false;
+}
+
+function safeRead(absPath) {
+  try {
+    const st = statSync(absPath);
+    if (!st.isFile() || st.size > MAX_FILE_SIZE) return null;
+    return readFileSync(absPath, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function buildTree() {
+  try {
+    const output = execSync(
+      "git ls-files -co --exclude-standard",
+      { encoding: "utf8", cwd: ROOT, maxBuffer: 4 * 1024 * 1024 }
+    );
+    return output
+      .trim()
+      .split("\n")
+      .filter((p) => p && !shouldSkip(p))
+      .map((p) => {
+        try {
+          const st = statSync(join(ROOT, p));
+          return { path: p, type: "blob", size: st.size };
+        } catch {
+          return { path: p, type: "blob", size: 0 };
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
+// ── Initial sync ────────────────────────────────────────────────────────
+function fullSync() {
+  const tree = buildTree();
+  doc.transact(() => {
+    // Update tree
+    yTree.delete(0, yTree.length);
+    for (const item of tree) yTree.push([item]);
+
+    // Update meta
+    yMeta.set("repo", repoFullName);
+    yMeta.set("lastSync", Date.now());
+    yMeta.set("fileCount", tree.length);
+
+    // Sync small text files that are likely to be viewed
+    for (const item of tree) {
+      if (item.size > MAX_FILE_SIZE) continue;
+      const content = safeRead(join(ROOT, item.path));
+      if (content !== null) {
+        yFiles.set(item.path, content);
+      }
+    }
+  });
+  console.log(`📁 Synced ${tree.length} files to room ${ROOM}`);
+}
+
+// Wait for connection before initial sync
+provider.once("sync", () => {
+  console.log("🔄 Initial sync...");
+  fullSync();
+});
+
+// ── File watcher ────────────────────────────────────────────────────────
+const pending = new Map(); // path → timeout
+let treeRefreshTimer = null;
+
+function scheduleTreeRefresh() {
+  if (treeRefreshTimer) clearTimeout(treeRefreshTimer);
+  treeRefreshTimer = setTimeout(() => {
+    treeRefreshTimer = null;
+    const tree = buildTree();
+    doc.transact(() => {
+      yTree.delete(0, yTree.length);
+      for (const item of tree) yTree.push([item]);
+      yMeta.set("fileCount", tree.length);
+      yMeta.set("lastSync", Date.now());
+    });
+  }, 500);
+}
+
+// ── Paste burst detection helpers ──────────────────────────────────────
+function commonPrefixLen(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  return i;
+}
+function commonSuffixLen(a, b, startA) {
+  const lenA = a.length;
+  const lenB = b.length;
+  const limit = Math.min(lenA - startA, lenB - startA);
+  let i = 0;
+  while (
+    i < limit &&
+    a.charCodeAt(lenA - 1 - i) === b.charCodeAt(lenB - 1 - i)
+  )
+    i++;
+  return i;
+}
+
+// Throttle: maksimal 1 report / 5 detik per file untuk hindari spam.
+const lastPasteAt = new Map(); // path → ts
+const PASTE_THROTTLE_MS = 5000;
+
+async function schedulePasteReport(ev) {
+  console.log(
+    `📋 paste detected in ${ev.path}: +${ev.insertedLines} lines / ${ev.insertedChars} chars`,
+  );
+  const last = lastPasteAt.get(ev.path) || 0;
+  if (Date.now() - last < PASTE_THROTTLE_MS) {
+    console.log("   ↳ throttled (5s window)");
+    return;
+  }
+  lastPasteAt.set(ev.path, Date.now());
+
+  // Update yMeta supaya instruktur lihat realtime di panel
+  try {
+    const recent = (yMeta.get("recentPastes") || []).slice(-9);
+    recent.push({
+      path: ev.path,
+      lines: ev.insertedLines,
+      chars: ev.insertedChars,
+      ts: ev.ts,
+    });
+    yMeta.set("recentPastes", recent);
+    yMeta.set("lastPasteAt", ev.ts);
+  } catch {
+    /* ignore */
+  }
+
+  // Persist ke dashboard (kalau token tersedia)
+  const DASHBOARD = env.LAB_DASHBOARD_URL || "";
+  const TOKEN = env.GITHUB_TOKEN || env.LAB_GITHUB_TOKEN || "";
+  if (!DASHBOARD || !TOKEN) {
+    console.warn(
+      `   ⚠️  skip POST: ${!DASHBOARD ? "LAB_DASHBOARD_URL kosong " : ""}${!TOKEN ? "GITHUB_TOKEN kosong" : ""}`,
+    );
+    return;
+  }
+  try {
+    const r = await fetch(`${DASHBOARD.replace(/\/$/, "")}/api/lab/paste-events`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${TOKEN}`,
+      },
+      body: JSON.stringify({
+        repo: repoFullName,
+        filePath: ev.path,
+        linesAdded: ev.insertedLines,
+        charsAdded: ev.insertedChars,
+        snippet: ev.preview,
+      }),
+    });
+    const txt = await r.text().catch(() => "");
+    if (!r.ok) {
+      console.warn(`   ⚠️  paste-events HTTP ${r.status}: ${txt.slice(0, 200)}`);
+    } else {
+      console.log(`   ✅ paste-events stored: ${txt.slice(0, 120)}`);
+    }
+  } catch (e) {
+    console.warn(`   ⚠️  paste-events fetch err:`, e?.message || e);
+  }
+}
+
+function onFileChange(relPath) {
+  if (shouldSkip(relPath)) return;
+  // Debounce per-file
+  if (pending.has(relPath)) clearTimeout(pending.get(relPath));
+  pending.set(
+    relPath,
+    setTimeout(() => {
+      pending.delete(relPath);
+      const absPath = join(ROOT, relPath);
+      const content = safeRead(absPath);
+      const wasKnown = yFiles.has(relPath);
+      if (content !== null) {
+        // ── Paste detection: bandingkan dengan versi sebelumnya ──
+        const prev = yFiles.get(relPath) || "";
+        const addedChars = content.length - prev.length;
+        const addedLines = content.split("\n").length - prev.split("\n").length;
+        // Unconditional debug log — gampang verify detector hidup
+        console.log(
+          `   diff: +${addedChars}c +${addedLines}L (prev=${prev.length}c → now=${content.length}c, known=${wasKnown})`,
+        );
+        try {
+          if (addedChars >= 300 || addedLines >= 8) {
+            const lcp = commonPrefixLen(prev, content);
+            const lcs = commonSuffixLen(prev, content, lcp);
+            const inserted = content.slice(lcp, content.length - lcs);
+            console.log(
+              `   ↳ inserted block: ${inserted.length}c / ${inserted.split("\n").length}L`,
+            );
+            if (inserted.length >= 150 || inserted.split("\n").length >= 5) {
+              schedulePasteReport({
+                path: relPath,
+                addedChars,
+                addedLines,
+                insertedChars: inserted.length,
+                insertedLines: inserted.split("\n").length,
+                preview: inserted.slice(0, 600),
+                ts: Date.now(),
+              });
+            } else {
+              console.log("   ↳ inserted block too small, skip");
+            }
+          }
+        } catch (e) {
+          console.warn("   ⚠️  paste detector error:", e?.message || e);
+        }
+        doc.transact(() => {
+          yFiles.set(relPath, content);
+          yMeta.set("lastEdit", Date.now());
+          yMeta.set("lastEditPath", relPath);
+        });
+        console.log(`✏️  ${relPath} (${content.length} chars)`);
+        if (!wasKnown) scheduleTreeRefresh(); // file baru → tambahkan ke tree
+      } else {
+        // File deleted or became binary/too large
+        if (wasKnown) {
+          doc.transact(() => {
+            yFiles.delete(relPath);
+            yMeta.set("lastEdit", Date.now());
+          });
+          console.log(`🗑️  ${relPath} removed`);
+          scheduleTreeRefresh();
+        }
+      }
+    }, DEBOUNCE_MS)
+  );
+}
+
+// Recursive fs.watch
+try {
+  const watcher = watch(ROOT, { recursive: true }, (event, filename) => {
+    // event = 'change' (modify) atau 'rename' (create/delete/rename)
+    if (filename) onFileChange(filename.toString());
+  });
+  watcher.on("error", (err) => {
+    console.error("⚠️  Watcher error:", err.message);
+  });
+  console.log(`👁️  Watching ${ROOT} for changes...`);
+} catch (err) {
+  console.error("❌ fs.watch failed:", err.message);
+  console.error("   Falling back to polling...");
+  // Fallback: re-sync every 5 seconds
+  setInterval(fullSync, 5000);
+}
+
+// Periodic tree refresh (picks up new/deleted files)
+setInterval(() => {
+  const tree = buildTree();
+  doc.transact(() => {
+    yTree.delete(0, yTree.length);
+    for (const item of tree) yTree.push([item]);
+    yMeta.set("lastSync", Date.now());
+    yMeta.set("fileCount", tree.length);
+  });
+}, 15_000);
+
+// ── Terminal tail (lab-run output) ──────────────────────────────────────
+// Publish isi /tmp/lab-terminal.log ke yMeta.terminal supaya panel
+// instruktur bisa tampilkan stream terminal mahasiswa.
+const TERM_LOG = env.LAB_TERMINAL_LOG || "/tmp/lab-terminal.log";
+const TERM_MAX_BYTES = 32_000; // 32KB tail
+let termTimer = null;
+let termLastSize = -1;
+
+function publishTerminal() {
+  try {
+    const st = statSync(TERM_LOG);
+    if (!st.isFile()) return;
+    if (st.size === termLastSize) return;
+    termLastSize = st.size;
+    let content = readFileSync(TERM_LOG, "utf8");
+    if (content.length > TERM_MAX_BYTES) {
+      content = "…(truncated)…\n" + content.slice(-TERM_MAX_BYTES);
+    }
+    doc.transact(() => {
+      yMeta.set("terminal", content);
+      yMeta.set("terminalAt", Date.now());
+    });
+  } catch {
+    // file belum ada — biarkan
+  }
+}
+
+function scheduleTerminalPublish() {
+  if (termTimer) clearTimeout(termTimer);
+  termTimer = setTimeout(() => {
+    termTimer = null;
+    publishTerminal();
+  }, 250);
+}
+
+try {
+  // Initial publish + watch
+  publishTerminal();
+  watch(TERM_LOG, { persistent: true }, () => scheduleTerminalPublish());
+  console.log(`📟 Watching terminal log: ${TERM_LOG}`);
+} catch {
+  // File belum ada → poll setiap 2 detik sampai muncul
+  const poll = setInterval(() => {
+    try {
+      statSync(TERM_LOG);
+      clearInterval(poll);
+      publishTerminal();
+      try {
+        watch(TERM_LOG, { persistent: true }, () => scheduleTerminalPublish());
+        console.log(`📟 Watching terminal log: ${TERM_LOG}`);
+      } catch {
+        // ignore
+      }
+    } catch {
+      // belum ada
+    }
+  }, 2000);
+}
+
+// ── Persist terminal snapshot ke DB lewat /api/lab/terminal-log ─────────
+// Supaya instruktur bisa replay log lama (bukan cuma tail real-time).
+// Throttle 20 detik agar gak spam server.
+const DASHBOARD = env.LAB_DASHBOARD_URL || "";
+const GH_TOKEN = env.GITHUB_TOKEN || env.LAB_GITHUB_TOKEN || "";
+const PERSIST_EVERY_MS = 20_000;
+let lastPersistAt = 0;
+let lastPersistedSize = -1;
+
+async function persistTerminal() {
+  if (!DASHBOARD || !GH_TOKEN) return;
+  try {
+    const st = statSync(TERM_LOG);
+    if (!st.isFile()) return;
+    if (st.size === lastPersistedSize) return;
+    if (Date.now() - lastPersistAt < PERSIST_EVERY_MS) return;
+    lastPersistAt = Date.now();
+    lastPersistedSize = st.size;
+
+    let content = readFileSync(TERM_LOG, "utf8");
+    if (content.length > 64_000) content = content.slice(-64_000);
+
+    await fetch(`${DASHBOARD.replace(/\/$/, "")}/api/lab/terminal-log`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${GH_TOKEN}`,
+      },
+      body: JSON.stringify({ repo: repoFullName, content }),
+    }).catch(() => {});
+  } catch {
+    // ignore
+  }
+}
+setInterval(persistTerminal, PERSIST_EVERY_MS);
+
+// ── Self-update ─────────────────────────────────────────────────────────
+// Setiap 10 menit cek /api/lab/version. Kalau hash file helper di server
+// berbeda dengan yang kita pegang, download ulang lalu exit(75); wrapper
+// /usr/local/bin/lab-live akan restart kita otomatis.
+import { writeFileSync, chmodSync } from "node:fs";
+
+const SELF_PATH = env.LAB_LIVE_PATH || "/opt/lab-live/lab-live.mjs";
+const HELPERS = [
+  { name: "lab-live.mjs", target: SELF_PATH, mode: 0o644 },
+  { name: "lab-run", target: "/usr/local/bin/lab-run", mode: 0o755 },
+  { name: "lab-help.sh", target: "/usr/local/bin/lab-help", mode: 0o755 },
+  { name: "lab-log.sh", target: "/usr/local/bin/lab-log", mode: 0o755 },
+];
+
+function sha1(buf) {
+  // tiny inline sha1 via subtle? gampang: pakai crypto
+  return cryptoMod.createHash("sha1").update(buf).digest("hex");
+}
+
+let cryptoMod;
+let knownHashes = {};
+
+async function initSelfUpdate() {
+  try {
+    cryptoMod = await import("node:crypto");
+    for (const h of HELPERS) {
+      try {
+        const buf = readFileSync(h.target);
+        knownHashes[h.name] = sha1(buf);
+      } catch {
+        knownHashes[h.name] = null;
+      }
+    }
+    console.log("🔁 self-update aktif (poll /api/lab/version setiap 10 menit)");
+  } catch {
+    /* ignore */
+  }
+}
+
+async function checkForUpdate() {
+  if (!DASHBOARD) return;
+  try {
+    const r = await fetch(
+      `${DASHBOARD.replace(/\/$/, "")}/api/lab/version`,
+      { headers: { "Cache-Control": "no-cache" } },
+    );
+    if (!r.ok) return;
+    const j = await r.json();
+    const remote = j?.files || {};
+    let needRestart = false;
+    for (const h of HELPERS) {
+      const remoteSha = remote[h.name];
+      if (!remoteSha) continue;
+      if (knownHashes[h.name] === remoteSha) continue;
+      // download new file
+      const url = `${DASHBOARD.replace(/\/$/, "")}/${h.name}`;
+      const dl = await fetch(url);
+      if (!dl.ok) continue;
+      const buf = Buffer.from(await dl.arrayBuffer());
+      const got = sha1(buf);
+      if (got !== remoteSha) continue;
+      try {
+        writeFileSync(h.target, buf);
+        chmodSync(h.target, h.mode);
+        knownHashes[h.name] = got;
+        console.log(`⬆️  updated ${h.name} (${got.slice(0, 8)})`);
+        if (h.name === "lab-live.mjs") needRestart = true;
+      } catch (e) {
+        console.warn(`update ${h.name} failed:`, e?.message || e);
+      }
+    }
+    if (needRestart) {
+      console.log("♻️  lab-live updated, exit(75) untuk restart…");
+      provider.disconnect();
+      setTimeout(() => exit(75), 250);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+initSelfUpdate().then(() => {
+  setInterval(checkForUpdate, 10 * 60 * 1000);
+  // first check setelah 30 detik supaya gak ganggu startup
+  setTimeout(checkForUpdate, 30_000);
+});
+
+// ── Graceful shutdown ───────────────────────────────────────────────────
+function shutdown() {
+  console.log("\n🛑 Shutting down lab-live...");
+  provider.disconnect();
+  doc.destroy();
+  exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+console.log(`
+┌─────────────────────────────────────────┐
+│  🔴 lab-live active                     │
+│  Repo:  ${repoFullName.padEnd(32)}│
+│  Room:  ${ROOM.padEnd(32)}│
+│  WS:    ${wsUrl.substring(0, 32).padEnd(32)}│
+│                                         │
+│  Edit any file → instructor sees it     │
+│  instantly on the dashboard.            │
+│  Press Ctrl+C to stop.                  │
+└─────────────────────────────────────────┘
+`);

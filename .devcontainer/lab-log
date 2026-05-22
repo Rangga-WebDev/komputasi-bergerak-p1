@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# lab-log — kirim 1 error/log cepat ke dashboard instruktur.
+#
+# Usage:
+#   lab-log "TypeError: x is not a function"
+#   lab-log -k build -t npm "Cannot find module 'react'"
+#   lab-log -f src/app.ts:42 "ReferenceError di handleClick"
+#   lab-log -s ./error.log "lihat stack di file ini"
+#   echo "$err" | lab-log               # baca dari stdin
+#
+# Flags:
+#   -k KIND     build|runtime|test|lint|other  (default: runtime)
+#   -t TOOL     nama tool (npm, node, python, jest, …)
+#   -f FILE[:LINE]   file:line lokasi error
+#   -s STACK_FILE    path file berisi stack trace lengkap
+#   -x EXITCODE      exit code (kalau relevan)
+#
+# Required env (auto-set di Codespace):
+#   GITHUB_TOKEN, GITHUB_REPOSITORY, LAB_DASHBOARD_URL
+
+set -euo pipefail
+
+KIND="runtime"
+TOOL=""
+FILE_PATH=""
+LINE_NUM=""
+STACK_FILE=""
+EXIT_CODE=""
+
+while getopts ":k:t:f:s:x:h" opt; do
+  case "$opt" in
+    k) KIND="$OPTARG" ;;
+    t) TOOL="$OPTARG" ;;
+    f)
+      FILE_PATH="$OPTARG"
+      if [[ "$FILE_PATH" =~ ^(.+):([0-9]+)$ ]]; then
+        FILE_PATH="${BASH_REMATCH[1]}"
+        LINE_NUM="${BASH_REMATCH[2]}"
+      fi
+      ;;
+    s) STACK_FILE="$OPTARG" ;;
+    x) EXIT_CODE="$OPTARG" ;;
+    h) sed -n '2,18p' "$0"; exit 0 ;;
+    \?) echo "unknown option -$OPTARG" >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# Pesan dari arg, atau dari stdin kalau di-pipe.
+MESSAGE="${*:-}"
+STDIN_BUF=""
+if [[ ! -t 0 ]]; then
+  STDIN_BUF="$(cat)"
+fi
+
+if [[ -z "$MESSAGE" && -n "$STDIN_BUF" ]]; then
+  # Ambil baris error pertama, fallback baris pertama.
+  MESSAGE="$(printf '%s\n' "$STDIN_BUF" \
+    | grep -i -m1 -E 'error|fail|exception|traceback|panic' \
+    || printf '%s\n' "$STDIN_BUF" | grep -m1 .)"
+fi
+
+if [[ -z "$MESSAGE" ]]; then
+  echo "Usage: lab-log [opts] \"pesan error\"   (atau pipe via stdin)" >&2
+  exit 1
+fi
+
+MESSAGE="$(printf '%s' "$MESSAGE" | head -c 480)"
+
+: "${GITHUB_TOKEN:?GITHUB_TOKEN tidak terdeteksi (jalankan dari Codespace)}"
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY tidak terdeteksi}"
+
+DASHBOARD_URL="${LAB_DASHBOARD_URL:-${NEXT_PUBLIC_DASHBOARD_URL:-}}"
+if [[ -z "$DASHBOARD_URL" ]]; then
+  echo "❌ LAB_DASHBOARD_URL belum diset di Codespace secrets / .env." >&2
+  exit 1
+fi
+
+# Stack: dari -s file, atau dari stdin (kalau ada & beda dari MESSAGE).
+STACK=""
+if [[ -n "$STACK_FILE" && -r "$STACK_FILE" ]]; then
+  STACK="$(head -c 18000 "$STACK_FILE")"
+elif [[ -n "$STDIN_BUF" ]]; then
+  STACK="$(printf '%s' "$STDIN_BUF" | head -c 18000)"
+fi
+
+# Auto-extract file:line dari MESSAGE kalau belum diset.
+if [[ -z "$FILE_PATH" && "$MESSAGE" =~ ([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+):([0-9]+) ]]; then
+  FILE_PATH="${BASH_REMATCH[1]}"
+  LINE_NUM="${BASH_REMATCH[2]}"
+fi
+
+# Build JSON pakai python (selalu tersedia di Codespace).
+PAYLOAD=$(
+  GH_REPO="$GITHUB_REPOSITORY" \
+  KIND="$KIND" TOOL="$TOOL" MESSAGE="$MESSAGE" STACK="$STACK" \
+  FILE_PATH="$FILE_PATH" LINE_NUM="$LINE_NUM" EXIT_CODE="$EXIT_CODE" \
+  python3 -c '
+import json, os
+out = {
+  "repo": os.environ["GH_REPO"],
+  "kind": os.environ["KIND"] or "runtime",
+  "message": os.environ["MESSAGE"],
+}
+if os.environ.get("TOOL"):      out["tool"]  = os.environ["TOOL"]
+if os.environ.get("STACK"):     out["stack"] = os.environ["STACK"]
+if os.environ.get("FILE_PATH"): out["file"]  = os.environ["FILE_PATH"]
+if os.environ.get("LINE_NUM"):  out["line"]  = int(os.environ["LINE_NUM"])
+if os.environ.get("EXIT_CODE"): out["exitCode"] = int(os.environ["EXIT_CODE"])
+print(json.dumps(out))
+'
+)
+
+HTTP=$(curl -sS -o /tmp/lab-log.out -w "%{http_code}" \
+  -X POST "$DASHBOARD_URL/api/lab/error-log" \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD")
+
+if [[ "$HTTP" != "200" ]]; then
+  echo "❌ Gagal kirim log (HTTP $HTTP):" >&2
+  cat /tmp/lab-log.out >&2
+  exit 1
+fi
+
+OCC=$(python3 -c 'import json,sys; print(json.load(open("/tmp/lab-log.out")).get("occurrences",1))' 2>/dev/null || echo 1)
+echo "📡 Log terkirim (×${OCC}). Instruktur bisa lihat di dashboard."

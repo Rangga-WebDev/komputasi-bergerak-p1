@@ -1,0 +1,25 @@
+{
+  // Auto-start lab-live setiap kali folder repo dibuka di VS Code / Codespaces.
+  // Pakai `runOn: folderOpen` (bukan postStartCommand) karena VS Code yang
+  // me-manage prosesnya — lebih reliable daripada nohup di postStartCommand
+  // yang sering dibunuh oleh Codespaces lifecycle.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "lab-live (auto)",
+      "type": "shell",
+      "command": "if command -v lab-live >/dev/null 2>&1; then lab-live; else echo '⚠️  lab-live belum ter-install. Jalankan: bash .devcontainer/install-lab-helper.sh'; fi",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false,
+        "clear": false
+      },
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

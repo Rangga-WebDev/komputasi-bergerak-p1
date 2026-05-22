@@ -1,0 +1,75 @@
+// Drop-in starter `.devcontainer/devcontainer.json` for assignment templates.
+// Pengamanan terhadap kecurangan AI / copy-paste:
+//   1. Copilot, Copilot Chat, Continue, Codeium, Cody, dll. di-DISABLE
+//      lewat `customizations.vscode.settings` + ditandai `unwantedRecommendations`.
+//   2. `editor.pasteAs` di-set agar paste plain saja; auto-snapshot mendorong
+//      branch wip/snapshot tiap 2 menit sehingga dosen melihat progres.
+//   3. `lab-help` dipasang agar mahasiswa bisa raise hand dari terminal.
+//   4. `activity-monitor` memasang pre-commit hook yang menulis
+//      `.lab/activity.jsonl` (LOC, durasi, velocity) — di-commit bersama
+//      kode agar bisa di-scan dosen.
+//
+// `LAB_DASHBOARD_URL` di-set sebagai Codespace organization secret.
+{
+  "name": "Praktikum Codespace",
+  "image": "mcr.microsoft.com/devcontainers/universal:latest",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "containerEnv": {
+    "LAB_DASHBOARD_URL": "https://absensi.lab.if.unismuh.ac.id",
+    "LAB_YJS_WS_URL": "wss://absensi.lab.if.unismuh.ac.id/yjs"
+  },
+  "postCreateCommand": "bash .devcontainer/block-copilot.sh && bash .devcontainer/install-lab-helper.sh && bash .devcontainer/activity-monitor.sh install",
+  "postStartCommand": "bash .devcontainer/block-copilot.sh && bash .devcontainer/auto-snapshot.sh start",
+  "postAttachCommand": {
+    "lab-live": "bash -c 'set -e; if [ -z \"$LAB_YJS_WS_URL\" ]; then echo \"LAB_YJS_WS_URL belum diset; skip lab-live.\"; exit 0; fi; if ! command -v lab-live >/dev/null 2>&1; then echo \"lab-live belum ter-install; run install-lab-helper.sh\"; bash .devcontainer/install-lab-helper.sh || true; fi; if pgrep -f /opt/lab-live/lab-live.mjs >/dev/null 2>&1; then echo \"lab-live already running\"; else nohup lab-live >/tmp/lab-live.log 2>&1 & disown; sleep 1; echo \"lab-live started (pid=$(pgrep -f /opt/lab-live/lab-live.mjs | head -n1))\"; fi'"
+  },
+  "remoteUser": "codespace",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "github.copilot.enable": {
+          "*": false,
+          "plaintext": false,
+          "markdown": false,
+          "scminput": false
+        },
+        "github.copilot.editor.enableAutoCompletions": false,
+        "github.copilot.chat.enabled": false,
+        "chat.commandCenter.enabled": false,
+        "chat.agent.enabled": false,
+        "inlineChat.enabled": false,
+        "chat.experimental.offerSetup": false,
+        "editor.pasteAs.enabled": true,
+        "editor.pasteAs.showPasteSelector": "never",
+        "editor.copyWithSyntaxHighlighting": false,
+        "files.trimTrailingWhitespace": true,
+        "files.autoSave": "afterDelay",
+        "files.autoSaveDelay": 2000,
+        "telemetry.telemetryLevel": "off",
+        "security.workspace.trust.enabled": false,
+        "security.workspace.trust.startupPrompt": "never",
+        "task.allowAutomaticTasks": "on"
+      },
+      "extensions": [
+        "esbenp.prettier-vscode"
+      ],
+      "unwantedRecommendations": [
+        "github.copilot",
+        "github.copilot-chat",
+        "github.copilot-labs",
+        "continue.continue",
+        "codeium.codeium",
+        "tabnine.tabnine-vscode",
+        "sourcegraph.cody-ai",
+        "blackboxapp.blackbox",
+        "mintlify.document",
+        "aminer.codegeex",
+        "danielsanmedium.dscodegpt",
+        "rubberduck.rubberduck-vscode",
+        "ms-toolsai.vscode-ai"
+      ]
+    }
+  }
+}
