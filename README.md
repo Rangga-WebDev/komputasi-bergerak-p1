@@ -62,3 +62,14 @@ lab-help "stuck di error TouchableOpacity"
 - Push ke GitHub repo masing-masing (`main` branch).
 - Sertakan **screenshot** hasil di folder pertemuan terkait.
 - Autograder akan jalan otomatis via GitHub Actions.
+
+## Screenshot Hasil APLIKASI
+![Screenshot PERTEMUAN 1](./tugas-pertemuan-01/SS-Aplikasi/s1.jpeg)
+![Screenshot PERTEMUAN 1](./tugas-pertemuan-01/SS-Aplikasi/s2.jpeg)
+![Screenshot PERTEMUAN 1](./tugas-pertemuan-01/SS-Aplikasi/s3.jpeg)
+![Screenshot PERTEMUAN 1](./tugas-pertemuan-01/SS-Aplikasi/s4.jpeg)
+
+## Screenshit Hasil TERMINAL
+![Screenshot PERTEMUAN 1](tugas-pertemuan-01/SS-Terminal/t1.png)
+![Screenshot PERTEMUAN 1](tugas-pertemuan-01/SS-Terminal/t2.png)
+![Screenshot PERTEMUAN 1](tugas-pertemuan-01/SS-Terminal/t3.png)
